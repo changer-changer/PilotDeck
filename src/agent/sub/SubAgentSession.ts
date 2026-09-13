@@ -431,6 +431,7 @@ export class SubAgentSession {
         // Other child setup events are local to its synthetic session. The
         // host receives child activity through the subagent events above.
       },
+      backgroundTasks: this.options.parentDependencies.backgroundTasks,
     };
   }
 

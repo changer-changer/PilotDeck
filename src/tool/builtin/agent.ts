@@ -87,6 +87,8 @@ export type AgentToolInput = {
    * context and only the new `prompt` is appended.
    */
   task_id?: string;
+  /** Run a new child in the background for this active parent request. */
+  run_in_background?: boolean;
 };
 
 export type AgentToolOutput = {
@@ -102,6 +104,15 @@ export type AgentToolOutput = {
    * `task_id` to continue this child with its prior context.
    */
   taskId?: string;
+};
+
+/** Output shape of the background (`run_in_background: true`) branch. */
+export type AgentBackgroundOutput = {
+  taskId: string;
+  subagentId: string;
+  subagentType: string;
+  description: string;
+  runInBackground: true;
 };
 
 export type CreateAgentToolOptions = {
@@ -173,7 +184,7 @@ function mapContinuationError(error: unknown): PilotDeckToolRuntimeError | undef
 
 export function createAgentTool(
   options: CreateAgentToolOptions = {},
-): PilotDeckToolDefinition<AgentToolInput, AgentToolOutput> {
+): PilotDeckToolDefinition<AgentToolInput, AgentToolOutput | AgentBackgroundOutput> {
   const fallbackPresets = options.subagents ?? BUILTIN_SUBAGENTS;
   const description = buildAgentToolDescription();
 
@@ -212,6 +223,10 @@ export function createAgentTool(
           description:
             "Optional task id returned as `task_id` by a previous agent call. When present, the same child subagent continues with its prior context: its earlier user/assistant/tool history is restored and only the new `prompt` is added. Omit `subagent_type` to reuse the task's saved identity, or pass the matching type (a conflicting type fails).",
         },
+        run_in_background: {
+          type: "boolean",
+          description: "Run a new child in the background; continue independent work while its report is delivered before this turn ends. Use task_output / task_wait / task_stop with the returned taskId. Cannot be combined with task_id; resume completed children synchronously.",
+        },
       },
     },
     maxResultBytes: 200_000,
@@ -239,6 +254,16 @@ export function createAgentTool(
       );
       const directive = input.prompt;
       const taskId = normalizeTaskId(input.task_id);
+
+      if (input.run_in_background) {
+        if (taskId) {
+          throw new PilotDeckToolRuntimeError("invalid_tool_input",
+            "task_id cannot be combined with run_in_background. Omit run_in_background to continue the existing child; its history and model will be preserved.");
+        }
+        let requestedType = explicit ?? "general-purpose";
+        if ((context.permissionContext?.mode === "plan" || context.runMode === "ask") && requestedType === "general-purpose") requestedType = "explore";
+        return runBackgroundFork({ input, context, requestedType, directive });
+      }
 
       // Full fork path (C2): preferred when AgentLoop wired the fork API.
       if (context.subagent) {
@@ -369,6 +394,10 @@ export function buildAskModeAgentToolSchema(): {
         maxLength: 256,
         description:
           "Optional task id returned as `task_id` by a previous agent call. When present, the same child subagent continues with its prior context and only the new `prompt` is added. Omit `subagent_type` to reuse the task's saved identity.",
+      },
+      run_in_background: {
+        type: "boolean",
+        description: "Run a new child in the background; continue independent work while its report is delivered before this turn ends. Use task_output / task_wait / task_stop with the returned taskId. Cannot be combined with task_id; resume completed children synchronously.",
       },
     },
   };
@@ -519,6 +548,93 @@ async function runFullFork(args: {
       activeTaskContinuations.delete(guardKey);
     }
   }
+}
+
+/**
+ * Background fork branch (`run_in_background: true`). Queues the subagent via
+ * the loop-provided `startBackground` API and returns immediately with a
+ * stable `taskId` (=== `subagentId`) the parent can track with the `task_*`
+ * tools. Validation mirrors the sync fork path and happens BEFORE queueing so
+ * a rejected call never leaves an orphan task. When no background backend is
+ * wired this fails with `unsupported_tool` — it must never silently fall back
+ * to a synchronous fork.
+ */
+async function runBackgroundFork(args: {
+  input: AgentToolInput;
+  context: PilotDeckToolRuntimeContext;
+  requestedType: string;
+  directive: string;
+}): Promise<PilotDeckToolExecutionOutput<AgentBackgroundOutput>> {
+  const { input, context, requestedType, directive } = args;
+  const fork = context.subagent;
+  const startBackground = fork?.startBackground;
+  if (!fork || !startBackground) {
+    throw new PilotDeckToolRuntimeError(
+      "unsupported_tool",
+      "run_in_background requires an agent runtime with BackgroundTaskRuntime wiring. This runtime cannot queue background subagents; omit run_in_background to run the subagent synchronously.",
+    );
+  }
+  if (!fork.isAllowedDefinition(requestedType)) {
+    const allowed = fork.listDefinitions().map((d) => d.id).join(", ");
+    throw new PilotDeckToolRuntimeError(
+      "invalid_tool_input",
+      `Unknown subagent_type "${requestedType}". Available: ${allowed}.`,
+    );
+  }
+  const currentDepth = context.subagentDepth ?? fork.depth ?? 0;
+  if (currentDepth >= fork.maxSubagentDepth) {
+    throw new PilotDeckToolRuntimeError(
+      "tool_execution_failed",
+      `subagent_depth_exceeded (depth=${currentDepth}, max=${fork.maxSubagentDepth}); nested background fork rejected.`,
+      { errorCode: "subagent_depth_exceeded" },
+    );
+  }
+  const subagentId = randomUUID();
+  let queued: { taskId: string; subagentId: string; subagentType: string };
+  try {
+    queued = await startBackground({
+      definitionId: requestedType,
+      directive,
+      description: input.description,
+      subagentId,
+      toolCallId: context.currentToolCallId,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new PilotDeckToolRuntimeError(
+      "tool_execution_failed",
+      `agent background fork failed to queue: ${message}`,
+      { errorCode: "subagent_execution_failed" },
+    );
+  }
+  const output: AgentBackgroundOutput = {
+    taskId: queued.taskId,
+    subagentId: queued.subagentId,
+    subagentType: queued.subagentType,
+    description: input.description,
+    runInBackground: true,
+  };
+  return {
+    content: [
+      {
+        type: "text",
+        text: [
+          `[${requestedType}] ${input.description}`,
+          "",
+          `Queued as a background task: taskId=${output.taskId}. After completion, pass task_id=${output.taskId} in a synchronous agent call to continue this child. Keep working on independent steps; the subagent's final report is delivered automatically as a background_subagent_result message before this turn ends.`,
+          "- task_output / task_wait: inspect progress or block on this taskId",
+          "- task_stop: cancel this taskId if the result is no longer needed",
+        ].join("\n"),
+      },
+      { type: "json", value: output },
+    ],
+    data: output,
+    metadata: {
+      subagent: requestedType,
+      subagentId: output.subagentId,
+      forkMode: "background",
+    },
+  };
 }
 
 async function runFallback(args: {
