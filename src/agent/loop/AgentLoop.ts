@@ -2562,56 +2562,100 @@ export class AgentLoop {
           id: profile.id,
           description: profile.description,
         })),
-      isAllowedDefinition: (id: string) =>
-        dispatchable.some((profile) => profile.id === id),
-      fork: async ({ definitionId, directive, subagentId, toolCallId, abortSignal, timeoutMs, model }) => {
-        // Depth is re-checked here so nesting is refused at runtime even when
-        // the caller bypasses the model-facing schema (defense in depth).
+      isAllowedDefinition: (id: string) => dispatchable.some((profile) => profile.id === id),
+      supportsContinuation: Boolean(
+        this.dependencies.subagentTranscript?.loadSubagentContinuation
+        && this.dependencies.subagentTranscript?.subagentTranscriptResolver,
+      ),
+      fork: async (args) => {
+        const {
+          definitionId: requestedDefinitionId,
+          directive,
+          subagentId,
+          taskId,
+          toolCallId,
+          abortSignal,
+          timeoutMs,
+          model,
+        } = args;
         if (depth >= maxDepth) {
-          throw new PilotDeckToolRuntimeError(
-            "tool_execution_failed",
+          throw new PilotDeckToolRuntimeError("tool_execution_failed",
             `subagent_depth_exceeded (depth=${depth}, max=${maxDepth}); nested fork rejected.`,
-            { errorCode: "subagent_depth_exceeded" },
-          );
+            { errorCode: "subagent_depth_exceeded" });
         }
-        const profile = dispatchable.find((candidate) => candidate.id === definitionId);
-        if (!profile) {
-          const available = dispatchable.map((candidate) => candidate.id).join(", ") || "none";
-          throw new PilotDeckToolRuntimeError("invalid_tool_input",
-            `Unknown subagent_type "${definitionId}". Available: ${available}.`);
-        }
-        const selectedModel = this.resolveSubagentModel(profile, model);
         // Defer SubAgentSession import to avoid the runtime cycle (sub → loop → sub).
         const { SubAgentSession } = await import("../sub/SubAgentSession.js");
-        const def = profile;
+        const { SubagentContinuationError } = await import("../sub/continuation.js");
+        const transcriptHooks = this.dependencies.subagentTranscript;
+
+        // task_id continuation — validate ownership/history BEFORE opening
+        // anything else. Storage logic lives behind the persistence hook.
+        let continuation: import("../sub/continuation.js").SubagentContinuationState | undefined;
+        let definitionId = requestedDefinitionId;
+        if (taskId) {
+          const loader = transcriptHooks?.loadSubagentContinuation;
+          if (!loader) {
+            throw new SubagentContinuationError(
+              "subagent_task_unsupported",
+              "task_id continuation requires subagent transcript persistence, which is not configured in this runtime.",
+            );
+          }
+          continuation = await loader({
+            sessionId: input.sessionId,
+            subagentId: taskId,
+            requestedDefinitionId,
+          });
+          definitionId = continuation.definitionId;
+        }
+        if (!definitionId) {
+          throw new Error("Subagent fork requires a subagent definition id.");
+        }
+        const def = (continuation ? profiles.filter((profile) => profile.enabled) : dispatchable)
+          .find((profile) => profile.id === definitionId);
+        if (!def) {
+          if (continuation) {
+            throw new SubagentContinuationError(
+              "subagent_task_history_unsupported",
+              `saved task definition "${definitionId}" is unknown in this runtime.`,
+            );
+          }
+          throw new PilotDeckToolRuntimeError("invalid_tool_input", `Unknown subagent_type "${definitionId}". Available: ${dispatchable.map((profile) => profile.id).join(", ") || "none"}.`);
+        }
+        const selectedModel = continuation
+          ? (this.dependencies.getSubagentModels
+            ? this.resolveSubagentModel(def, `${continuation.provider}/${continuation.model}`)
+            : undefined)
+          : this.resolveSubagentModel(def, model);
+        // A continuation reuses the task's UUID as the child identity.
+        const effectiveSubagentId = taskId ?? subagentId;
         const composedAbort = composeAbortSignal({
           parent: abortSignal,
           timeoutMs,
         });
 
-        const subagentSessionId = `${this.config.cwd}::sub::${subagentId}`;
-        const transcriptHooks = this.dependencies.subagentTranscript;
-        const sidechain = transcriptHooks?.subagentTranscriptResolver?.(subagentId);
+        const subagentSessionId =
+          continuation?.subagentSessionId ?? `${this.config.cwd}::sub::${effectiveSubagentId}`;
+        const sidechain = transcriptHooks?.subagentTranscriptResolver?.(effectiveSubagentId);
         const transcriptRelativePath = sidechain?.transcriptRelativePath ?? "";
 
         await transcriptHooks?.recordSubagentStarted?.({
           sessionId: input.sessionId,
           turnId: input.turnId,
-          subagentId,
+          subagentId: effectiveSubagentId,
           subagentType: def.id,
           prompt: directive,
           transcriptRelativePath,
           subagentSessionId,
         });
         await this.dispatchLifecycle(input, "SubagentStart", {
-          subagentId,
+          subagentId: effectiveSubagentId,
           subagentType: def.id,
         });
         this.dependencies.eventEmitter?.({
           type: "subagent_started",
           sessionId: input.sessionId,
           turnId: input.turnId,
-          subagentId,
+          subagentId: effectiveSubagentId,
           subagentType: def.id,
           toolCallId,
         });
@@ -2620,6 +2664,16 @@ export class AgentLoop {
           model: selectedModel,
           definition: def,
           directive,
+          ...(continuation
+            ? {
+                priorMessages: continuation.messages,
+                turnIndex: continuation.nextTurnIndex,
+                continuationModel: {
+                  provider: continuation.provider,
+                  model: continuation.model,
+                },
+              }
+            : {}),
           parentConfig: {
             ...this.config,
             subagentDepth: depth + 1,
@@ -2632,12 +2686,21 @@ export class AgentLoop {
           parentSessionId: input.sessionId,
           parentTurnId: input.turnId,
           subagentSessionId,
-          subagentId,
+          subagentId: effectiveSubagentId,
           abortSignal: composedAbort.signal,
           sidechainTranscript: sidechain
             ? {
                 recordAcceptedInput: sidechain.recordAcceptedInput.bind(sidechain),
                 recordDurableMessage: sidechain.recordDurableMessage.bind(sidechain),
+                ...(sidechain.recordTurnResult
+                  ? { recordTurnResult: sidechain.recordTurnResult.bind(sidechain) }
+                  : {}),
+                ...(sidechain.recordControlBoundary
+                  ? { recordControlBoundary: sidechain.recordControlBoundary.bind(sidechain) }
+                  : {}),
+                ...(sidechain.recordSessionMetadata
+                  ? { recordSessionMetadata: sidechain.recordSessionMetadata.bind(sidechain) }
+                  : {}),
               }
             : undefined,
         });
@@ -2663,7 +2726,7 @@ export class AgentLoop {
           await transcriptHooks?.recordSubagentCompleted?.({
             sessionId: input.sessionId,
             turnId: input.turnId,
-            subagentId,
+            subagentId: effectiveSubagentId,
             subagentType: def.id,
             summary: failure instanceof Error ? failure.message : String(failure),
             turns: 0,
@@ -2671,7 +2734,7 @@ export class AgentLoop {
             errored: true,
           });
           await this.dispatchLifecycle(input, "SubagentStop", {
-            subagentId,
+            subagentId: effectiveSubagentId,
             subagentType: def.id,
             success: false,
           });
@@ -2679,7 +2742,7 @@ export class AgentLoop {
             type: "subagent_completed",
             sessionId: input.sessionId,
             turnId: input.turnId,
-            subagentId,
+            subagentId: effectiveSubagentId,
             subagentType: def.id,
             success: false,
             aborted,
@@ -2692,7 +2755,7 @@ export class AgentLoop {
         await transcriptHooks?.recordSubagentCompleted?.({
           sessionId: input.sessionId,
           turnId: input.turnId,
-          subagentId,
+          subagentId: effectiveSubagentId,
           subagentType: def.id,
           summary: report.markdown,
           usage: report.usage,
@@ -2701,7 +2764,7 @@ export class AgentLoop {
           errored,
         });
         await this.dispatchLifecycle(input, "SubagentStop", {
-          subagentId,
+          subagentId: effectiveSubagentId,
           subagentType: def.id,
           success: !errored,
         });
@@ -2709,7 +2772,7 @@ export class AgentLoop {
           type: "subagent_completed",
           sessionId: input.sessionId,
           turnId: input.turnId,
-          subagentId,
+          subagentId: effectiveSubagentId,
           subagentType: def.id,
           success: !errored,
           durationMs: report.durationMs,
@@ -2721,6 +2784,8 @@ export class AgentLoop {
           turns: report.turns,
           durationMs: report.durationMs,
           parsed: report.parsed as unknown as Record<string, string> | undefined,
+          subagentId: effectiveSubagentId,
+          definitionId: def.id,
         };
       },
     };
