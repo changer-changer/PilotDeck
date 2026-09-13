@@ -2051,7 +2051,7 @@ export class AgentLoop {
   private async createModelRequest(
     messages: CanonicalMessage[],
     input: AgentLoopInput,
-    options: { emitInstructionEvents?: boolean } = {},
+    options: { emitInstructionEvents?: boolean; previewOnly?: boolean } = {},
   ): Promise<CanonicalModelRequest> {
     const contextRuntime = this.dependencies.context ?? new NullContextRuntime();
     const planTodo = this.dependencies.planTodoManager?.forSession(input.sessionId);
@@ -2106,6 +2106,7 @@ export class AgentLoop {
     const requestProvider = input.modelOverride?.provider ?? this.config.provider;
     const requestModel = input.modelOverride?.model ?? this.config.model;
     const prepared = await contextRuntime.prepareForModel({
+      previewOnly: options.previewOnly,
       sessionId: input.sessionId,
       turnId: input.turnId,
       cwd: this.config.cwd,
@@ -2196,6 +2197,7 @@ export class AgentLoop {
     return async (candidateMessages) => {
       let candidateRequest = await this.createModelRequest(candidateMessages, input, {
         emitInstructionEvents: false,
+        previewOnly: true,
       });
       if (options.decision && options.baseRequest) {
         const patchedBase = { ...options.baseRequest, messages: candidateRequest.messages };
