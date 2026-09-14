@@ -2824,6 +2824,7 @@ export class AgentLoop {
       description: string;
       subagentId: string;
       toolCallId?: string;
+      timeoutMs?: number;
     },
   ): Promise<{ taskId: string; subagentId: string; subagentType: string }> {
     const bg = this.dependencies.backgroundTasks;
@@ -2848,7 +2849,7 @@ export class AgentLoop {
     }
 
     // The existing configurable subagent timeout applies; no extra timer.
-    const timeoutMs = this.config.subagentTimeoutMs ?? 3_600_000;
+    const timeoutMs = args.timeoutMs ?? this.config.subagentTimeoutMs ?? 3_600_000;
     const owned: OwnedBackgroundAgent = {
       taskId: args.subagentId,
       subagentId: args.subagentId,

@@ -101,6 +101,8 @@ export type PilotDeckSubagentForkApi = {
     description: string;
     subagentId: string;
     toolCallId?: string;
+    /** Execution timeout for this child; omission uses the configured default. */
+    timeoutMs?: number;
   }): Promise<{ taskId: string; subagentId: string; subagentType: string }>;
 };
 

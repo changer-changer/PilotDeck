@@ -89,6 +89,8 @@ export type AgentToolInput = {
   task_id?: string;
   /** Run a new child in the background for this active parent request. */
   run_in_background?: boolean;
+  /** Override the configured timeout for this dispatch, in integer milliseconds. */
+  timeout_ms?: number;
 };
 
 export type AgentToolOutput = {
@@ -133,6 +135,36 @@ const DEFAULT_MAX_OUTPUT_TOKENS = 65_536;
 const DEFAULT_PROVIDER_FALLBACK = "pilotdeck";
 const DEFAULT_MODEL_FALLBACK = "moonshotai/kimi-k2.6";
 const DEFAULT_SUBAGENT_TIMEOUT_MS = 60 * 60_000;
+/** Node timers cap at 2^31-1 ms (~24.8 days); enforce as the per-call bound. */
+const MAX_SUBAGENT_TIMEOUT_MS = 2_147_483_647;
+const TIMEOUT_MS_SCHEMA_PROPERTY = {
+  type: "integer",
+  description:
+    "Optional per-call timeout for the subagent run, in milliseconds (positive integer, max 2147483647). Overrides the runtime-configured subagent timeout, even if longer. Omitted: the configured timeout (default 1 hour) applies.",
+  minimum: 1,
+  maximum: MAX_SUBAGENT_TIMEOUT_MS,
+} as const;
+
+/** Validate direct calls as well as calls checked against the JSON schema. */
+function normalizeExplicitTimeoutMs(value: unknown): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (
+    typeof value !== "number" ||
+    !Number.isInteger(value) ||
+    value < 1 ||
+    value > MAX_SUBAGENT_TIMEOUT_MS
+  ) {
+    throw new PilotDeckToolRuntimeError(
+      "invalid_tool_input",
+      `timeout_ms must be an integer number of milliseconds between 1 and ${MAX_SUBAGENT_TIMEOUT_MS}.`,
+    );
+  }
+  return value;
+}
+
+
 
 /**
  * In-flight task_id continuations. Tool-scope (deliberately not agent
@@ -216,6 +248,7 @@ export function createAgentTool(
           type: "string",
           description: "Deprecated legacy alias for subagent_type. Prefer subagent_type.",
         },
+        timeout_ms: TIMEOUT_MS_SCHEMA_PROPERTY,
         task_id: {
           type: "string",
           minLength: 1,
@@ -253,6 +286,7 @@ export function createAgentTool(
         input.subagent_type ?? input.subagentType,
       );
       const directive = input.prompt;
+      const explicitTimeoutMs = normalizeExplicitTimeoutMs(input.timeout_ms);
       const taskId = normalizeTaskId(input.task_id);
 
       if (input.run_in_background) {
@@ -262,7 +296,7 @@ export function createAgentTool(
         }
         let requestedType = explicit ?? "general-purpose";
         if ((context.permissionContext?.mode === "plan" || context.runMode === "ask") && requestedType === "general-purpose") requestedType = "explore";
-        return runBackgroundFork({ input, context, requestedType, directive });
+        return runBackgroundFork({ input, context, requestedType, directive, explicitTimeoutMs });
       }
 
       // Full fork path (C2): preferred when AgentLoop wired the fork API.
@@ -280,8 +314,14 @@ export function createAgentTool(
           explicit,
           taskId,
           directive,
+          explicitTimeoutMs,
           fork: context.subagent,
         });
+      }
+
+      if (explicitTimeoutMs !== undefined) {
+        throw new PilotDeckToolRuntimeError("unsupported_tool",
+          "timeout_ms requires the full subagent runtime; this standalone single-shot runtime cannot enforce a per-call timeout.");
       }
 
       // Legacy stand-alone runtime has no sidechain persistence; never
@@ -388,6 +428,7 @@ export function buildAskModeAgentToolSchema(): {
         type: "string",
         description: "Deprecated legacy alias for subagent_type. Prefer subagent_type.",
       },
+      timeout_ms: TIMEOUT_MS_SCHEMA_PROPERTY,
       task_id: {
         type: "string",
         minLength: 1,
@@ -435,9 +476,10 @@ async function runFullFork(args: {
   /** task id of a previous child — when set, continue it instead of forking. */
   taskId: string | undefined;
   directive: string;
+  explicitTimeoutMs?: number;
   fork: PilotDeckSubagentForkApi;
 }): Promise<PilotDeckToolExecutionOutput<AgentToolOutput>> {
-  const { input, context, explicit, taskId, directive, fork } = args;
+  const { input, context, explicit, taskId, directive, explicitTimeoutMs, fork } = args;
   const guardKey = taskId ? JSON.stringify([context.cwd, context.sessionId, taskId]) : undefined;
 
   // Busy guard: acquired synchronously BEFORE the first await so two
@@ -475,7 +517,7 @@ async function runFullFork(args: {
       );
     }
     const subagentId = randomUUID();
-    const timeoutMs = context.subagentTimeoutMs ?? DEFAULT_SUBAGENT_TIMEOUT_MS;
+    const timeoutMs = explicitTimeoutMs ?? context.subagentTimeoutMs ?? DEFAULT_SUBAGENT_TIMEOUT_MS;
     let report;
     try {
       report = await fork.fork({
@@ -564,8 +606,9 @@ async function runBackgroundFork(args: {
   context: PilotDeckToolRuntimeContext;
   requestedType: string;
   directive: string;
+  explicitTimeoutMs?: number;
 }): Promise<PilotDeckToolExecutionOutput<AgentBackgroundOutput>> {
-  const { input, context, requestedType, directive } = args;
+  const { input, context, requestedType, directive, explicitTimeoutMs } = args;
   const fork = context.subagent;
   const startBackground = fork?.startBackground;
   if (!fork || !startBackground) {
@@ -598,6 +641,7 @@ async function runBackgroundFork(args: {
       description: input.description,
       subagentId,
       toolCallId: context.currentToolCallId,
+      timeoutMs: explicitTimeoutMs ?? context.subagentTimeoutMs ?? DEFAULT_SUBAGENT_TIMEOUT_MS,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
